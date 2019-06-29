@@ -6,7 +6,7 @@ import (
 	"net"
 	"testing"
 
-	"../meta"
+	"github.com/wqsa/bget/meta"
 )
 
 var testID = [20]byte{1, 2, 3}

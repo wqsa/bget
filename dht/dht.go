@@ -1,145 +1,190 @@
 package dht
 
 import (
-    "net"
-    "sync"
-    "time"
+	"errors"
+	"net"
+	"os"
+	"time"
+
+	"github.com/google/logger"
 )
 
 const (
-    bootstrapTimeOut = 3 * time.Second
+	bootstrapTimeOut = 3 * time.Second
+	minNodeNum       = 10
 )
 
 var (
-    bootstrap = []Node{
-        {ip:"router.bittorrent.com", port:6881},
-        {ip:"router.utorrent.com", port:6881},
-        {ip:"router.bitcomet.com", port:6881},
-    }
+	dhtLogger *logger.Logger
+
+	defaultBootNode []*node
 )
 
-type DHT struct {
-    me Node
-    table route
-    bootNode []Node
+func init() {
+	dhtLogger = logger.Init("DHT", false, false, os.Stdout)
+
+	bootNodes := []string{
+		"router.bittorrent.com:6881",
+		"router.utorrent.com:6881",
+		"router.bitcomet.com:6881",
+	}
+
+	defaultBootNode = make([]*node, 0, len(bootNodes))
+
+	for _, n := range bootNodes {
+		addr, err := net.ResolveUDPAddr("udp", n)
+		if err != nil {
+			dhtLogger.Warningf("init boot node:%v, err:%v", addr, err)
+			continue
+		}
+		n, err := newNode(nodeID{}, addr)
+		if err == nil {
+			defaultBootNode = append(defaultBootNode, n)
+		}
+	}
 }
 
-func NewDHT(m Node, nodes []Node, bootNode []Node) *DHT {
-    var wg sync.WaitGroup
-    for _, n := range nodes {
-        wg.Add(1)
-        go func() {
-            n.checkStatus()
-            wg.Done()
-        }()
-    }
-    wg.Wait()
-    d := &DHT{me:me, bootNode:bootNode}
-    for _, n := range nodes {
-        if n.state == statGood {
-            d.addNode(n)
-        }
-    }
-    d.bootstrap()
-    return d
+//DHT is Distributed Hash Table, see https://en.wikipedia.org/wiki/Distributed_hash_table
+type DHT struct {
+	own      *node
+	table    *table
+	bootNode []*node
+	rawNodeC chan *node
+	nodeCh   chan *node
+	msgCh    chan []byte
+	stopC    chan chan error
+	reqC     chan peerRequest
+}
+
+//NewDHT DHT create a DHT instance
+func NewDHT(m *node, nodes []*node, bootNode []*node) *DHT {
+	d := &DHT{own: m,
+		bootNode: bootNode,
+		table:    newTable(m),
+		rawNodeC: make(chan *node),
+		nodeCh:   make(chan *node),
+		msgCh:    make(chan []byte),
+		stopC:    make(chan chan error),
+		reqC:     make(chan peerRequest),
+	}
+	if d.bootNode == nil {
+		d.bootNode = defaultBootNode
+	}
+	for _, n := range nodes {
+		d.addNode(n)
+	}
+	d.bootstrap()
+	return d
 }
 
 func (d *DHT) bootstrap() {
-    randID := newNodeId()
-    var wg sync.WaitGroup
-    nsCh := make(chan []Node)
-    for _, n := range d.bootNode {
-        n := n
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            nodes, err := n.findNode(d.me.ID, randID)
-            if err != nil {
-                return
-            }
-            nsCh <- nodes:
-        }()
-    }
-    go func() {
-        wg.Wait()
-        close(nsCh)
-    }()
-    nCh := make(chan Node)
-    for ns := range nodes {
-        for _, n := range n {
-            n := n
-            wg.Add(1)
-            go func() {
-                defer wg.Done()
-                n.checkState()
-                if(n.state != stateGood) {
-                    return
-                }
-                nCh <- n
-            }()
-        }
-    }
-    go func() {
-        wg.Wait()
-        close(nCh)
-    }()
-    for n := range nCh {
-        d.addNode(n)
-    }
+	if d.table.count >= minNodeNum {
+		return
+	}
+	for _, n := range d.bootNode {
+		ns, err := n.findNode(&d.own.id, &d.own.id)
+		if err != nil {
+			dhtLogger.Warningf("find node from %v, err: %v", n.addr, err)
+			continue
+		}
+		dhtLogger.Infof("get %v node from %v", len(ns), n.addr)
+		for _, n := range ns {
+			d.addNode(n)
+		}
+	}
 }
 
-func (d* DHT) addNode(n *Node) bool {
-    if n.stat != statGood {
-        return false
-    }
-    d.table.set(d.me.distance(n), n)
-    return true
+type peerRequest struct {
+	infoHash [20]byte
+
+	peers chan []string
 }
 
-func (d* DHT) GetPeers(ctx context.Context, infoHash meta.Hash, peersCh chan <- []peer.Peers) {
-    nodes := d.table.getAll()
-    nodeCh := make(chan []Node)
-    ctx, cancel := context.WithCancel(ctx)
-    defer cancel()
-    f := func(n Node){
-        ps, ns, token, err := n.getPeers(me.ID, infoHash)
-        if err != nil {
-            d.table.remove(n)
-        }
-        if len(ps) != 0 {
-            select {
-            case peersCh <- ps:
-                go n.announce(d.node, d.impilePort, token)
-            case <-ctx.Done():
-                return
-            }
-        }
-        if len(ns) != 0 {
-            select {
-            case nodeCh <- ns:
-            case <- ctx.Done():
-                return
-            }
-        }
-    }
-    for _, n := range nodes {
-        go f(n)
-    }
-    for {
-        select {
-        case ns := <-nodeCh:
-            for _, n := range ns {
-                go f(n)
-                go func() {
-                    if n.ping(me.ID) {
-                        n.state = stateGood
-                        d.addNode(n)
-                    }
-                }()
-            }
-        case <-cxt.Done():
-            return
-        }
+//Run start a DHT instance
+func (d *DHT) Run() {
+	var err error
+	for {
+		select {
+		case n := <-d.rawNodeC:
+			go func() {
+				err := n.ping(&d.own.id)
+				if err != nil {
+					dhtLogger.Warning("check node fail, err:", err)
+					return
+				}
+				d.nodeCh <- n
+			}()
+		case n := <-d.nodeCh:
+			if n != nil {
+				d.table.addNode(n)
+			}
+		case req := <-d.reqC:
+			go d.getPeers(req)
+		case errC := <-d.stopC:
+			errC <- err
+		}
+	}
+}
 
-    }
+func (d *DHT) getPeers(req peerRequest) {
+	var f func(n *node) error
+	//stop the recrusion?
+	f = func(n *node) error {
+		if n == nil {
+			return errors.New("emptyt node")
+		}
+		peers, nodes, token, err := n.getPeers(&d.own.id, req.infoHash)
+		if err != nil {
+			return err
+		}
+		if len(peers) != 0 {
+			req.peers <- peers
+			n.announcePeer(d.own, req.infoHash, token)
+		}
+		if len(nodes) != 0 {
+			// d.nodeCh <- nodes
+			for _, n := range nodes {
+				d.nodeCh <- n
+				f(n)
+			}
+		}
+		return nil
+	}
+	d.table.foreach(f)
+}
+
+func (d *DHT) addNode(n *node) error {
+	go func() {
+		err := n.ping(&d.own.id)
+		dhtLogger.Infof("ping %v, result:%v", n.addr, err)
+		if err == nil {
+			d.rawNodeC <- n
+		}
+	}()
+	return nil
+}
+
+//GetPeers query peers from DHT by infohash
+func (d *DHT) GetPeers(infoHash [20]byte, peerC chan []string) {
+	d.reqC <- peerRequest{infoHash, peerC}
+}
+
+//AddNode add node addr to DHT
+func (d *DHT) AddNode(addrs []string) {
+	nodes := []*node{}
+	for _, addr := range addrs {
+		a, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			return
+		}
+		n, err := newNode(nodeID{}, a)
+		if err != nil {
+			return
+		}
+		nodes = append(nodes, n)
+
+	}
+	for _, n := range nodes {
+		d.nodeCh <- n
+	}
 }

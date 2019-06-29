@@ -6,9 +6,9 @@ import (
 
 	"github.com/google/logger"
 
-	"./meta"
-	"./peer"
-	"./tracker"
+	"github.com/wqsa/bget/meta"
+	"github.com/wqsa/bget/peer"
+	"github.com/wqsa/bget/tracker"
 )
 
 const (

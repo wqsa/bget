@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"../common/bitmap"
-	"../meta"
+	"github.com/wqsa/bget/common/bitmap"
+	"github.com/wqsa/bget/meta"
 
 	"github.com/google/logger"
 

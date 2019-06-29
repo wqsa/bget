@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"time"
 
-	"../meta"
+	"github.com/wqsa/bget/meta"
 )
 
 const (

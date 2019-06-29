@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"../meta"
+	"github.com/wqsa/bget/meta"
 )
 
 //announce event

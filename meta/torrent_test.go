@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"../bencode"
+	"github.com/wqsa/bget/bencode"
 )
 
 func TestTorrent(t *testing.T) {

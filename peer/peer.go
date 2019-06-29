@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"../bencode"
-	"../common/bitmap"
+	"github.com/wqsa/bget/bencode"
+	"github.com/wqsa/bget/common/bitmap"
 )
 
 const (

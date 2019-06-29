@@ -6,7 +6,7 @@ import (
 	"errors"
 	"time"
 
-	"../meta"
+	"github.com/wqsa/bget/meta"
 	"github.com/gohugoio/hugo/bufferpool"
 )
 

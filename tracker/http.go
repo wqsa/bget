@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"time"
 
-	"../bencode"
-	"../meta"
+	"github.com/wqsa/bget/bencode"
+	"github.com/wqsa/bget/meta"
 )
 
 //HTTPTracker is a tracker use HTTP

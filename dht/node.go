@@ -1,11 +1,13 @@
 package dht
 
 import (
-	"./bencode"
+	"bytes"
 	"crypto/sha1"
 	"errors"
 	"math/rand"
 	"net"
+
+	"github.com/wqsa/bget/common/utils"
 )
 
 const (
@@ -19,73 +21,172 @@ const (
 	bucketK   = 8
 	bucketNum = nodeIDLen * byteLen
 
-	stateUnknow = iota
+	stateIdle = iota
 	stateGood
-    stateQuestionable
+	stateQuestionable
 	stateBad
+	stateUnknow
 )
 
 var (
-	errNodeSize = errors.NEW("size of the data that will init node error")
+	errNodeSize = errors.New("size of the data that will init node error")
 )
 
 type nodeID [nodeIDLen]byte
 
 func newNodeID() nodeID {
-	var (
-		id  nodeID
-		pre [nodeIDLen / uint32Len]uint32
-	)
-	for i := range pre {
-		pre[i] = rand.Uint32()
+	var id [nodeIDLen]byte
+	for i := range id {
+		id[i] = byte(rand.Intn(i << 7))
 	}
-	copy(id[:], pre[:])
+	return id
+}
+
+func (id *nodeID) zero() bool {
+	return bytes.Equal(id.slice(), bytes.Repeat([]byte{0}, nodeIDLen))
+}
+
+func (id *nodeID) equal(o *nodeID) bool {
+	return bytes.Equal(id.slice(), o.slice())
+}
+
+func (id *nodeID) slice() []byte {
+	b := [nodeIDLen]byte(*id)
+	return b[:]
+}
+
+//MarshalBencode customize marshal nodeID in bencode
+func (id *nodeID) MarshalBencode() ([]byte, error) {
+	return append([]byte("20:"), id[:]...), nil
+}
+
+//UnmarshalBencode customize unmarshal nodeID in bencode
+func (id *nodeID) UnmarshalBencode(data []byte) error {
+	if len(data) != 20 {
+		return errors.New("not nodeID")
+	}
+	copy(id[:], data[:])
+	return nil
 }
 
 //node is a dht node
 type node struct {
 	id    nodeID
-	ip    net.IP
-	port  int
+	addr  net.Addr
+	cli   *krpcClient
 	state int
 }
 
 //newNode preduce a dht node by IP and port
-func newNode(ip string, port int) (n *node) {
-	if port <= 0 || port > maxPort {
-		return nil
+func newNode(id nodeID, addr net.Addr) (*node, error) {
+	n := &node{
+		id:    id,
+		addr:  addr,
+		state: stateIdle,
 	}
-	n.ip = net.ParseIP(ip)
-	if n.ip == nil {
-		return nil
+	ch, err := dial(addr.String())
+	if err != nil {
+		return nil, err
 	}
-	n.id = newNodeID()
-	n.port = port
-	n.state = stateNone
-	return
-}
-
-func uncompressNode(data []byte) (node, error) {
-	if len(data) != nodeSize {
-		return node{}, errNodeSize
-	}
-    n := node{}
-	copy(n.id[:], data[:20])
-	copy(n.ip, data[20:24])
-	//TODO n.port
-	n.state = stateUnknow
+	n.cli = newKrpcClient(ch)
 	return n, nil
 }
 
-func (n *node) checkStatus(me) {
-    if bytes.Equal(n.id, ping(me, n.id)) {
-        n.state = n.stateGood
-    } else {
-        switch n.state {
-        case stateGood:
-            n.state = stateQuestionable
-        case stateQuestionable, stateUnknow:
-            n.state = b.statBad
-        }
-    }
+func (n *node) checkStatus(me *node) {
+	err := n.ping(&me.id)
+	if err == nil {
+		n.state = stateGood
+	} else {
+		switch n.state {
+		case stateGood:
+			n.state = stateQuestionable
+		case stateQuestionable, stateUnknow:
+			n.state = stateBad
+		}
+	}
+}
+
+func (n *node) distance(other *node) int {
+	d := 0
+	var id [nodeIDLen]byte
+	for i := 0; i < nodeIDLen; i++ {
+		id[i] = [nodeIDLen]byte(n.id)[i] ^ [nodeIDLen]byte(other.id)[i]
+		for j := 0; j < 8; j++ {
+			if (id[i] & (1 << uint(j))) != 0 {
+				d++
+			}
+		}
+	}
+	return d
+}
+
+func uncompressNode(data []byte) (*node, error) {
+	if len(data) == 0 || len(data) != 26 {
+		return nil, nil
+	}
+	n := node{}
+	copy(n.id[:], data[:nodeIDLen])
+	addr, err := utils.ParseIPV4Addr(data[nodeIDLen:])
+	if err != nil {
+		return nil, err
+	}
+	n.addr, err = net.ResolveUDPAddr("udp", addr)
+	return &n, err
+}
+
+func uncompressNodes(data []byte) ([]*node, error) {
+	if len(data) == 0 || len(data)%26 != 0 {
+		return nil, nil
+	}
+	nodes := make([]*node, len(data)/26)
+	for i := 0; i < len(data); i += 26 {
+		n, err := uncompressNode(data[i : i+26])
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, n)
+	}
+	return nodes, nil
+}
+
+func (n *node) checkID(id *nodeID) error {
+	if id == nil || id.zero() {
+		return errors.New("id not match")
+	}
+	if n.id.zero() {
+		n.id = *id
+		return nil
+	}
+	if !n.id.equal(id) {
+		return errors.New("id not match")
+	}
+	return nil
+}
+
+func (n *node) ping(ownID *nodeID) error {
+	id, err := n.cli.ping(ownID)
+	if err != nil {
+		return err
+	}
+	return n.checkID(id)
+}
+
+func (n *node) findNode(ownID *nodeID, target *nodeID) ([]*node, error) {
+	id, nodes, err := n.cli.findNode(ownID, target)
+	if err != nil {
+		return nil, err
+	}
+	err = n.checkID(id)
+	if err != nil {
+		return nil, err
+	}
+	return nodes, nil
+}
+
+func (n *node) getPeers(ownID *nodeID, infoHash [20]byte) ([]string, []*node, string, error) {
+	return n.cli.getPeers(ownID, infoHash)
+}
+
+func (n *node) announcePeer(own *node, infoHash [20]byte, token string) (*nodeID, error) {
+	return n.cli.announcePeer(own, infoHash, token)
 }

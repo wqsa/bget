@@ -8,7 +8,7 @@ import (
 
 	"github.com/google/logger"
 
-	"../meta"
+	"github.com/wqsa/bget/meta"
 )
 
 var (

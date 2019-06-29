@@ -6,7 +6,7 @@ import (
 	"net"
 	"strconv"
 
-	"../meta"
+	"github.com/wqsa/bget/meta"
 )
 
 const (

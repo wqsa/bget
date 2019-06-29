@@ -13,10 +13,10 @@ import (
 
 	"github.com/google/logger"
 
-	"../common/bitmap"
-	"../filesystem"
-	"../meta"
-	"../tracker"
+	"github.com/wqsa/bget/common/bitmap"
+	"github.com/wqsa/bget/filesystem"
+	"github.com/wqsa/bget/meta"
+	"github.com/wqsa/bget/tracker"
 )
 
 const (

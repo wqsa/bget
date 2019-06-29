@@ -14,8 +14,8 @@ import (
 
 	"github.com/google/logger"
 
-	"./meta"
-	"./peer"
+	"github.com/wqsa/bget/meta"
+	"github.com/wqsa/bget/peer"
 )
 
 const (

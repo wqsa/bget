@@ -9,9 +9,9 @@ import (
 	"net"
 	"time"
 
-	"../common/bitmap"
-	"../filesystem"
-	"../meta"
+	"github.com/wqsa/bget/common/bitmap"
+	"github.com/wqsa/bget/filesystem"
+	"github.com/wqsa/bget/meta"
 
 	"github.com/gohugoio/hugo/bufferpool"
 	"github.com/google/logger"

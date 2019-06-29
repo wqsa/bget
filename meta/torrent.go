@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"../bencode"
+	"github.com/wqsa/bget/bencode"
 )
 
 var (
