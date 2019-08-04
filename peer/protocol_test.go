@@ -23,12 +23,13 @@ var handshakeTestCase = []struct {
 }
 
 func TestHandshake(t *testing.T) {
-	server := NewServer("127.0.0.1", 19960, "0.0.1")
+	serverAddr := "127.0.0.1:19960"
+	server := NewServer(serverAddr, "0.0.1")
 	server.id = testID
 	ch := make(chan struct{})
 	go func() {
-		if server.Listen() != nil {
-			t.Error("server listen fail")
+		if err := server.Listen(); err != nil {
+			t.Error("server listen fail", err)
 		}
 		ch <- struct{}{}
 		for i, c := range handshakeTestCase {
@@ -57,7 +58,7 @@ func TestHandshake(t *testing.T) {
 		extension = c.exten
 		p := new(peer)
 		p.id = c.id
-		p.addr = "127.0.0.1:19960"
+		p.addr = serverAddr
 		if err := p.handshake(c.hash); err != nil {
 			t.Errorf("%v: send handshake fail:%v\n", i, err)
 		}

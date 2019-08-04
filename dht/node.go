@@ -72,19 +72,23 @@ func (id *nodeID) UnmarshalBencode(data []byte) error {
 //node is a dht node
 type node struct {
 	id    nodeID
-	addr  net.Addr
+	addr  string
 	cli   *krpcClient
 	state int
 }
 
 //newNode preduce a dht node by IP and port
-func newNode(id nodeID, addr net.Addr) (*node, error) {
+func newNode(id nodeID, addr string) (*node, error) {
+	_, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, err
+	}
 	n := &node{
 		id:    id,
 		addr:  addr,
 		state: stateIdle,
 	}
-	ch, err := dial(addr.String())
+	ch, err := dial(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +134,7 @@ func uncompressNode(data []byte) (*node, error) {
 	if err != nil {
 		return nil, err
 	}
-	n.addr, err = net.ResolveUDPAddr("udp", addr)
+	n.addr = addr
 	return &n, err
 }
 

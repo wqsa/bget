@@ -1,35 +1,19 @@
-package bittorrent
+package bget
 
 import (
 	"context"
-	"errors"
 	"net"
 	"os"
 	"regexp"
-	"runtime"
 	"strconv"
-	"sync"
-	"time"
 	"unicode"
 
 	"github.com/google/logger"
+	"github.com/pkg/errors"
 
+	"github.com/wqsa/bget/dht"
 	"github.com/wqsa/bget/meta"
 	"github.com/wqsa/bget/peer"
-)
-
-const (
-	maxTask           = 5
-	maxMemory         = 256 * 1024 * 1024
-	defaultVersion    = "0.1.0"
-	defaultIP         = "127.0.0.1"
-	defaultPort       = 6228
-	defaultIdentifier = "GD"
-
-	sendDHTTimeout = time.Second
-
-	//see https://semver.org
-	versionExpr = `([0-9]\.){2}[0-9](\-{1}([0-9A-Za-z]+\.)*[[0-9A-Za-z]+)?(\+{1}([0-9A-Za-z]+\.)*[[0-9A-Za-z]+)?`
 )
 
 var (
@@ -47,7 +31,10 @@ var (
 )
 
 func init() {
-	home := homeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		panic(err)
+	}
 	if home == "" {
 		defaultDir = "./Downloads"
 	} else {
@@ -57,78 +44,34 @@ func init() {
 	validVersion = regexp.MustCompile(versionExpr)
 }
 
-func homeDir() string {
-	switch runtime.GOOS {
-	case "darwin":
-		return os.Getenv("HOMEPATH") + "\\"
-	case "linux":
-		return os.Getenv("HOME") + "/"
-	}
-	return ""
-}
-
 //Download is top-level instance
 type Download struct {
-	tasks      map[string]*task
-	server     *peer.Server
-	defaultDir string
-	memory     int64
-	memc       chan int64
-	ctx        context.Context
-	cancel     context.CancelFunc
+	tasks  map[string]*task
+	server *peer.Server
+	dht    *dht.DHT
+	cfg    *Configuration
+	memc   chan int64
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-//New creates an instance of Download by default config.
-func New() (d *Download, err error) {
-	return NewDownload(defaultIP, defaultIP, defaultDir, defaultIdentifier,
-		defaultVersion, defaultPort, defaultPort)
-}
-
-//NewDownload creates an instance of Download by detailed parameters
-func NewDownload(peerIP, dhtIP, dir, brand, version string, peerPort, dhtPort int) (d *Download, err error) {
-	if len(brand) > 2 || !isStringPrint(brand) {
-		return nil, ErrIdentFormat
-	}
-	if validVersion.FindString(version) != version {
-		return nil, ErrVersionFormat
-	}
-	d = new(Download)
+//New creates an instance of Download
+func New(cfg *Configuration) (*Download, error) {
+	d := new(Download)
 	d.tasks = make(map[string]*task)
-	err = d.setDefaultDir(dir)
-	if err != nil {
-		return
-	}
 	d.ctx = context.Background()
 	d.ctx, d.cancel = context.WithCancel(d.ctx)
-	//dht.Run(ctx, dhtIP, dhtPort, version)
-	d.server = peer.NewServer(peerIP, peerPort, version)
-	if d.server == nil {
-		panic("ss")
+	var err error
+	d.server, err = peer.NewServer(net.JoinHostPort(cfg.Options.IP, strconv.Itoa(cfg.Options.Port)))
+	if err != nil {
+		return nil, err
 	}
-	d.memc = make(chan int64, 10)
-	go func() {
-		for {
-			select {
-			case m := <-d.memc:
-				d.memory += m
-				logger.Infoln("use memory:", d.memory)
-				if d.memory > maxMemory {
-					var wg sync.WaitGroup
-					for _, t := range d.tasks {
-						wg.Add(1)
-						go func() {
-							t.save()
-							wg.Done()
-						}()
-					}
-					wg.Wait()
-				}
-			case <-d.ctx.Done():
-				return
-			}
-		}
-		return
-	}()
+	d.cfg = cfg
+	d.dht, err = dht.NewDHT(net.JoinHostPort(cfg.Options.IP, strconv.Itoa(cfg.Options.DHTPort)), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	go d.dht.Run()
 	go d.runServer(d.ctx)
 	return d, nil
 }
@@ -218,15 +161,6 @@ func (d *Download) Close() {
 		t.stop()
 	}
 	d.cancel()
-}
-
-func (d *Download) setDefaultDir(path string) error {
-	err := os.MkdirAll(path, os.ModeIrregular)
-	if err != nil {
-		return err
-	}
-	d.defaultDir = path
-	return nil
 }
 
 func isStringPrint(s string) bool {

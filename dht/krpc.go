@@ -271,7 +271,7 @@ func (c *krpcClient) announcePeer(own *node, infoHash [20]byte, token string) (*
 		Describe: descQuery,
 		Version:  c.version,
 	}
-	_, port, err := net.SplitHostPort(own.addr.String())
+	_, port, err := net.SplitHostPort(own.addr)
 	if err != nil {
 		return nil, err
 	}

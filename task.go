@@ -1,4 +1,4 @@
-package bittorrent
+package bget
 
 import (
 	"sync"
@@ -59,7 +59,7 @@ func (t *task) start() {
 	t.setState(stateRunning)
 	go func() {
 		left := int64(t.torrent.Info.PieceLength) * int64(len(t.torrent.Info.Pieces))
-		status := &tracker.DownloadStatus{0, 0, left}
+		status := &tracker.DownloadStatus{Download: 0, Upload: 0, Left: left}
 		addrs, err := t.trackers.Start(t.torrent.Info.Hash, status)
 		if err != nil {
 			logger.Warningf("no vaild tracker for %v\n", t.torrent.Info.Hash.String())

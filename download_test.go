@@ -1,8 +1,7 @@
-package bittorrent
+package bget
 
 import (
 	"os"
-	"regexp"
 	"testing"
 	"time"
 
@@ -14,20 +13,13 @@ func init() {
 }
 
 func TestDownload(t *testing.T) {
-	home := homeDir()
-	if home == "" {
-		defaultDir = "./Downloads"
-	}
-	defaultDir = home + "Downloads"
-
-	validVersion = regexp.MustCompile(versionExpr)
-
-	d, err := New()
+	cfg := NewConfig()
+	d, err := New(cfg)
 	if err != nil {
 		t.Error(err)
 		return
 	}
-	id, err := d.Add("E:/下载/kubuntu-18.10-desktop-amd64.iso.torrent", "./")
+	id, err := d.Add("./test/ubuntu-19.04-desktop-amd64.iso.torrent", "./")
 	if err != nil {
 		t.Error(err)
 		return

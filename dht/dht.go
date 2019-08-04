@@ -2,7 +2,6 @@ package dht
 
 import (
 	"errors"
-	"net"
 	"os"
 	"time"
 
@@ -32,12 +31,7 @@ func init() {
 	defaultBootNode = make([]*node, 0, len(bootNodes))
 
 	for _, n := range bootNodes {
-		addr, err := net.ResolveUDPAddr("udp", n)
-		if err != nil {
-			dhtLogger.Warningf("init boot node:%v, err:%v", addr, err)
-			continue
-		}
-		n, err := newNode(nodeID{}, addr)
+		n, err := newNode(newNodeID(), n)
 		if err == nil {
 			defaultBootNode = append(defaultBootNode, n)
 		}
@@ -57,15 +51,32 @@ type DHT struct {
 }
 
 //NewDHT DHT create a DHT instance
-func NewDHT(m *node, nodes []*node, bootNode []*node) *DHT {
-	d := &DHT{own: m,
-		bootNode: bootNode,
-		table:    newTable(m),
+func NewDHT(m string, nodes []*node, bootNode []string) (*DHT, error) {
+	var err error
+	d := &DHT{
 		rawNodeC: make(chan *node),
 		nodeCh:   make(chan *node),
 		msgCh:    make(chan []byte),
 		stopC:    make(chan chan error),
 		reqC:     make(chan peerRequest),
+	}
+	d.bootNode = defaultBootNode
+	d.own, err = newNode(newNodeID(), m)
+	if err != nil {
+		return nil, err
+	}
+	d.table = newTable(d.own)
+	for _, boot := range bootNode {
+		for _, n := range defaultBootNode {
+			if boot == n.addr {
+				continue
+			}
+		}
+		n, err := newNode(newNodeID(), boot)
+		if err != nil {
+			return nil, err
+		}
+		d.bootNode = append(d.bootNode, n)
 	}
 	if d.bootNode == nil {
 		d.bootNode = defaultBootNode
@@ -74,7 +85,7 @@ func NewDHT(m *node, nodes []*node, bootNode []*node) *DHT {
 		d.addNode(n)
 	}
 	d.bootstrap()
-	return d
+	return d, nil
 }
 
 func (d *DHT) bootstrap() {
@@ -173,11 +184,7 @@ func (d *DHT) GetPeers(infoHash [20]byte, peerC chan []string) {
 func (d *DHT) AddNode(addrs []string) {
 	nodes := []*node{}
 	for _, addr := range addrs {
-		a, err := net.ResolveUDPAddr("udp", addr)
-		if err != nil {
-			return
-		}
-		n, err := newNode(nodeID{}, a)
+		n, err := newNode(newNodeID(), addr)
 		if err != nil {
 			return
 		}

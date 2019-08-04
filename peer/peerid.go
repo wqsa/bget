@@ -1,7 +1,13 @@
 package peer
 
 import (
-	"math/rand"
+	"bytes"
+	"errors"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/wqsa/bget/common/utils"
 )
 
 var clientPrefix = map[string]string{
@@ -107,47 +113,117 @@ var clientPrefix = map[string]string{
 
 type peerStyle int
 
+//peerID style
 const (
-	styAzureus peerStyle = iota
-	styShadow
+	styleAzureus peerStyle = iota
+	styleShadow
 )
+
+const (
+	//see https://semver.org
+	versionExpr = `([0-9]\.){2}[0-9](\-{1}([0-9A-Za-z]+\.)*[[0-9A-Za-z]+)?(\+{1}([0-9A-Za-z]+\.)*[[0-9A-Za-z]+)?`
+
+	idLength = 20
+)
+
+var (
+	validVersion *regexp.Regexp
+)
+
+func init() {
+	validVersion = regexp.MustCompile(versionExpr)
+}
 
 type peerIDError struct {
 	style peerStyle
 	msg   string
 }
 
+type peerID [idLength]byte
+
 func (e *peerIDError) Error() string {
 	switch e.style {
-	case styAzureus:
+	case styleAzureus:
 		return e.msg + "for Azureus style peer ID"
-	case styShadow:
+	case styleShadow:
 		return e.msg + "for Shadow style peer ID"
 	}
 	return e.msg + "for unknow style peer ID"
 }
 
-func getID(style peerStyle, prefix, version string) [PeerIDLen]byte {
+//newID return a new peer id
+func newID(style peerStyle, client, version string) (peerID, error) {
 	switch style {
-	case styAzureus:
-		return getAzureusID(prefix, version)
+	case styleAzureus:
+		return newAzureusID(client, version)
+	case styleShadow:
+		return newShadowID(client, version)
 	}
-	return [PeerIDLen]byte{}
+	return peerID{}, errors.New("unknow style")
 }
 
-func getAzureusID(prefix, version string) [PeerIDLen]byte {
-	id := [PeerIDLen]byte{}
-	copy(id[:], []byte(prefix))
-	index := len(prefix)
-	for i := range version {
-		if version[i] != '.' {
-			id[index] = version[i]
-			index++
+//newAzureusID return Azureus style peer id, for detail:https://wiki.theory.org/index.php/BitTorrentSpecification#peer_id
+func newAzureusID(client, version string) (peerID, error) {
+	if !bytes.Equal(validVersion.Find([]byte(version)), []byte(version)) {
+		return peerID{}, &peerIDError{styleAzureus, "invaild version"}
+	}
+	if len(client) > 2 {
+		client = client[:2]
+	}
+	v := strings.Split(version, ".")
+	if len(v) > 3 {
+		v = v[:3]
+	}
+	identifier := "-" + client + strings.Join(v, "") + "-"
+	id := [idLength]byte{}
+	copy(id[:], []byte(identifier))
+	b := utils.RandBytes(idLength - len(identifier))
+	copy(id[len(identifier):], b)
+	return peerID(id), nil
+}
+
+//newShadowID return Shadow style peer id, for detail:https://wiki.theory.org/index.php/BitTorrentSpecification#peer_id
+func newShadowID(client, version string) (peerID, error) {
+	if !bytes.Equal(validVersion.Find([]byte(version)), []byte(version)) {
+		return peerID{}, &peerIDError{styleShadow, "invaild version"}
+	}
+	if len(client) > 1 {
+		client = client[:1]
+	}
+	v := strings.Split(version, ".")
+	if len(v) > 3 {
+		v = v[:3]
+	}
+	identifier := client
+	for i := range v {
+		n, err := strconv.Atoi(v[i])
+		if err == nil {
+			panic(err)
+		}
+		if n < 10 {
+			identifier += v[i]
+		} else if n < 36 {
+			identifier += string(byte('A') + byte(n) - 10)
+		} else if n < 62 {
+			identifier += string(byte('a') + byte(n) - 36)
+		} else if n == 62 {
+			identifier += "."
+		} else if n == 63 {
+			identifier += "-"
+		} else {
+			return peerID{}, &peerIDError{styleShadow, "version reach max"}
 		}
 	}
-	for index < 20 {
-		id[index] = byte(rand.Int() % 10)
-		index++
-	}
-	return id
+	id := [idLength]byte{}
+	copy(id[:], []byte(identifier))
+	b := utils.RandBytes(idLength - len(identifier))
+	copy(id[len(identifier):], b)
+	return peerID(id), nil
+}
+
+func newRandomID() peerID {
+	b := utils.RandBytes(idLength)
+	id := [PeerIDLen]byte{}
+	copy(id[:], b[:idLength])
+	return peerID(id)
 }
