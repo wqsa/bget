@@ -3,12 +3,13 @@ package meta
 import (
 	"context"
 	"crypto/sha1"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"os"
 	"strings"
+
+	"github.com/pkg/errors"
 
 	"github.com/wqsa/bget/bencode"
 )
@@ -184,6 +185,17 @@ func NewTorrent(path string) (*Torrent, error) {
 		t.Info.Files[i].Download = true
 	}
 	return t, nil
+}
+
+func (t *Torrent) Vaild() bool {
+	pieceCount := t.Info.Length / int64(t.Info.PieceLength)
+	if t.Info.Length%int64(t.Info.PieceLength) > 0 {
+		pieceCount++
+	}
+	if int(pieceCount)*sha1.Size != len(t.Info.Pieces) {
+		return false
+	}
+	return true
 }
 
 func (t *Torrent) SetFile(index int, download bool) error {

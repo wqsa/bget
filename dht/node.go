@@ -3,9 +3,10 @@ package dht
 import (
 	"bytes"
 	"crypto/sha1"
-	"errors"
 	"math/rand"
 	"net"
+
+	"github.com/pkg/errors"
 
 	"github.com/wqsa/bget/common/utils"
 )
@@ -130,7 +131,7 @@ func uncompressNode(data []byte) (*node, error) {
 	}
 	n := node{}
 	copy(n.id[:], data[:nodeIDLen])
-	addr, err := utils.ParseIPV4Addr(data[nodeIDLen:])
+	addr, err := utils.ParseCompressIPV4Addr(data[nodeIDLen:])
 	if err != nil {
 		return nil, err
 	}

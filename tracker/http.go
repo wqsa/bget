@@ -1,7 +1,6 @@
 package tracker
 
 import (
-	"errors"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -9,25 +8,21 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/wqsa/bget/bencode"
+	"github.com/wqsa/bget/common"
 	"github.com/wqsa/bget/meta"
 )
 
-//HTTPTracker is a tracker use HTTP
-type HTTPTracker struct {
-	url       string
+//httpTracker is a tracker use HTTP
+type httpTracker struct {
+	serverURL *url.URL
 	trackerID int
 	nextTime  time.Time
 	compress  bool
 }
 
-type httpTrackerReq url.Values
-
-func (req *httpTrackerReq) set(key, value string) {
-	(*url.Values)(req).Set(key, value)
-}
-
-type httpTrackerResp struct {
+type httpTrackerResponse struct {
 	FailReason  string             `bencode:"failure reason,omitpty"`
 	Warning     string             `bencode:"warning message,omitpty"`
 	WaitTime    time.Duration      `bencode:"interval,omitpty"`
@@ -39,68 +34,61 @@ type httpTrackerResp struct {
 	Peers       bencode.RawMessage `bencode:"peers,omitpty"`
 }
 
-//NewHTTPTracker create a http tracker by url
-func NewHTTPTracker(url string) *HTTPTracker {
-	return &HTTPTracker{url: url, compress: true}
-}
-
-func (t *HTTPTracker) getWaitTime() time.Time {
-	return t.nextTime
+//NewhttpTracker create a http tracker by url
+func newhttpTracker(u *url.URL) *httpTracker {
+	return &httpTracker{serverURL: u, compress: true}
 }
 
 //Announce is used for announce to http tracker
-func (t *HTTPTracker) Announce(hash meta.Hash, id []byte, ip net.IP, port int, event int, status *DownloadStatus) ([]string, error) {
-	if event == EventNone {
-		time.Sleep(t.nextTime.Sub(time.Now()))
-	}
-	req := httpTrackerReq{}
-	req.set("peer_id", string(id))
-	req.set("ip", ip.String())
-	req.set("port", strconv.FormatUint(uint64(port), 10))
-	req.set("info_hash", string(hash[:]))
-	if t.compress {
-		req.set("compact", "1")
-	} else {
-		req.set("compact", "0")
-	}
-	req.set("downloaded", strconv.FormatUint(uint64(status.Download), 10))
-	req.set("left", strconv.FormatUint(uint64(status.Left), 10))
-	req.set("uploaded", strconv.FormatUint(uint64(status.Upload), 10))
-	switch event {
-	case EventStart:
-		req.set("event", "started")
-	case EventComplete:
-		req.set("event", "completed")
-	case EventStop:
-		req.set("event", "stopped ")
-	}
-	reqURL := t.url + "?" + (url.Values)(req).Encode()
-	//fmt.Println(reqURL)
-	httpResp, err := http.Get(reqURL)
+func (t *httpTracker) announce(hash meta.Hash, id []byte, addr string, event Event, status *AnnounceStats) ([]string, error) {
+	resp, err := t.request(hash, id, addr, event, status)
 	if err != nil {
 		return nil, err
+	}
+	addrs, err := common.ParseCompressIPV4Addrs([]byte(resp.Peers))
+	if err != nil {
+		return nil, err
+	}
+	return addrs, nil
+}
+
+func (t *httpTracker) waitTime() time.Time {
+	return t.nextTime
+}
+
+func (t *httpTracker) request(hash meta.Hash, id []byte, addr string, event Event, status *AnnounceStats) (*httpTrackerResponse, error) {
+	if event == EventNone {
+		return nil, errors.New("time is not up")
+	}
+	query := t.serverURL.Query()
+	query.Set("peer_id", string(id))
+	ip, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	query.Set("ip", ip)
+	query.Set("port", port)
+	query.Set("info_hash", string(hash[:]))
+	if t.compress {
+		query.Set("compact", "1")
+	} else {
+		query.Set("compact", "0")
+	}
+	query.Set("downloaded", strconv.FormatUint(uint64(status.Download), 10))
+	query.Set("left", strconv.FormatUint(uint64(status.Left), 10))
+	query.Set("uploaded", strconv.FormatUint(uint64(status.Upload), 10))
+	query.Set("event", event.String())
+	t.serverURL.RawQuery = query.Encode()
+	httpResp, err := http.Get(t.serverURL.String())
+	if err != nil {
+		return nil, errors.WithStack(err)
 	}
 	defer httpResp.Body.Close()
 	body, err := ioutil.ReadAll(httpResp.Body)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
-	resp := httpTrackerResp{}
-	err = bencode.Unmarshal(body, &resp)
-	if err != nil {
-		return nil, err
-	}
-	if resp.FailReason != "" {
-		return nil, errors.New("announce fail " + resp.FailReason)
-	}
-	t.nextTime = time.Now().Add(time.Duration(resp.WaitTime))
-	peers := convAddrs([]byte(resp.Peers))
-	if peers == nil {
-		return nil, errHTTPResp
-	}
-	return peers, nil
-}
-
-func (t *HTTPTracker) close() error {
-	return nil
+	resp := new(httpTrackerResponse)
+	err = bencode.Unmarshal(body, resp)
+	return resp, err
 }

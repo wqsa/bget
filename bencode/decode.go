@@ -3,8 +3,8 @@ package bencode
 import (
 	"bytes"
 	"encoding"
-	"errors"
 	"fmt"
+	"github.com/pkg/errors"
 	"reflect"
 	"strconv"
 )

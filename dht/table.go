@@ -1,8 +1,9 @@
 package dht
 
 import (
-	"errors"
 	"time"
+
+	"github.com/pkg/errors"
 )
 
 const (

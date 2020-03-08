@@ -9,10 +9,11 @@ import (
 
 	"github.com/wqsa/bget/bencode"
 	"github.com/wqsa/bget/common/bitmap"
+	"github.com/wqsa/bget/meta"
 )
 
 const (
-	//PeerIDLen is length of peer id
+	//PeerIDLen is length of Peer id
 	PeerIDLen       = 20
 	compressPeerLen = 6
 
@@ -24,12 +25,13 @@ const (
 
 var (
 	errBaseLen    = errors.New("insufficient data for base length type")
-	errPeerFormat = errors.New("peer format error")
+	errPeerFormat = errors.New("Peer format error")
 )
 
-type peer struct {
+type Peer struct {
 	id            [PeerIDLen]byte
 	addr          string
+	infoHash      meta.Hash
 	conn          net.Conn
 	fastExtension bool
 	isInterest    bool
@@ -43,39 +45,44 @@ type peer struct {
 	Download      int64
 	Upload        int64
 	haveReq       bool
+	writec        chan msgMarshaler
+	readC         chan *message
 }
 
-func newPeer(id []byte, addr string) *peer {
+func (p *Peer) Addr() string {
+	return p.addr
+}
+func newPeer(id []byte, addr string) (*Peer, error) {
 	if id != nil && len(id) != PeerIDLen {
-		return nil
+		return nil, errors.New("bad peer id")
 	}
-	peer := &peer{addr: addr, state: stateInit, closing: make(chan struct{})}
+	Peer := &Peer{addr: addr, state: stateInit, closing: make(chan struct{})}
 	if id != nil {
-		copy(peer.id[:], id)
+		copy(Peer.id[:], id)
 	}
-	return peer
+	return Peer, nil
 }
 
-func (p *peer) getState() int {
+func (p *Peer) getState() int {
 	p.stateLock.RLock()
 	defer p.stateLock.RUnlock()
 	return p.state
 }
 
-func (p *peer) setState(state int) {
+func (p *Peer) setState(state int) {
 	p.stateLock.Lock()
 	defer p.stateLock.Unlock()
 	p.state = state
 	return
 }
 
-func (p *peer) UnmarshalBencode(data []byte) error {
+func (p *Peer) UnmarshalBencode(data []byte) error {
 	var content map[string]interface{}
 	err := bencode.Unmarshal(data, &content)
 	if err != nil {
 		return err
 	}
-	id, ok := content["peer id"].(string)
+	id, ok := content["Peer id"].(string)
 	if !ok || len(id) != PeerIDLen {
 		return errPeerFormat
 	}
@@ -99,32 +106,7 @@ type messageWithID struct {
 	Data   interface{}
 }
 
-func (p *peer) recvMessage(msgc chan<- *messageWithID) {
-	for {
-		m, err := p.readMessage()
-		if err != nil {
-			p.close()
-			return
-		}
-		if m.Length == 0 {
-			p.lastActive = time.Now()
-			continue
-		}
-		msg, err := p.dispatch(m)
-		if err != nil {
-			p.close()
-			return
-		}
-		select {
-		case msgc <- &msg:
-		case <-p.closing:
-			p.close()
-			return
-		}
-	}
-}
-
-func (p *peer) close() error {
+func (p *Peer) close() error {
 	p.stateLock.Lock()
 	defer p.stateLock.Unlock()
 	p.state = stateStop
@@ -133,7 +115,7 @@ func (p *peer) close() error {
 	return err
 }
 
-func (p *peer) Close() error {
+func (p *Peer) Close() error {
 	p.stateLock.RLock()
 	defer p.stateLock.RUnlock()
 	if p.state != stateRunning {
@@ -142,8 +124,4 @@ func (p *peer) Close() error {
 	close(p.closing)
 	//p.closing <- struct{}{}
 	return nil
-}
-
-func isChoke(err error) bool {
-	return err == errChoke
 }

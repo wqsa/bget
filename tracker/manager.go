@@ -1,112 +1,95 @@
 package tracker
 
 import (
-	"errors"
-	"net"
-	"sync"
 	"time"
 
-	"github.com/google/logger"
+	"github.com/pkg/errors"
+
+	jww "github.com/spf13/jwalterweatherman"
 
 	"github.com/wqsa/bget/meta"
-)
-
-var (
-	errNotFound = errors.New("can't find tracker")
-	errTask     = errors.New("no this task")
-	errCreate   = errors.New("create task fail")
-
-	keyInfoHash = "info hash"
-)
-
-//Tracker error
-var (
-	ErrNoVaildTracker = errors.New("no vaild tracker")
 )
 
 //Manager mange trackers of a task
 type Manager struct {
 	serverID   []byte
-	serverIP   string
-	serverPort int
-	now        int
-	nowLock    sync.RWMutex
+	serverAddr string
+	workIndex  int
 	trackers   []Tracker
+	reqC       chan announceRequest
 }
 
 //NewManager return a Manager instance
-func NewManager(trackers []string, id []byte, ip string, port int) *Manager {
-	m := &Manager{serverID: id, serverIP: ip, serverPort: port, now: -1}
-	m.trackers = make([]Tracker, len(trackers))
-	for i, a := range trackers {
-		t := NewTracker(a)
-		if t == nil {
+func NewManager(trackers []string, id []byte, addr string) (*Manager, error) {
+	m := &Manager{serverID: id, serverAddr: addr}
+	m.trackers = make([]Tracker, 0, len(trackers))
+	for _, u := range trackers {
+		t, err := newTracker(u)
+		if err != nil {
+			jww.DEBUG.Printf("%v is invaild", u)
 			continue
 		}
-		m.trackers[i] = t
+		m.trackers = append(m.trackers, t)
 	}
-	return m
+	if len(m.trackers) == 0 {
+		return nil, errors.New("no vaild tracker")
+	}
+	return m, nil
 }
 
 //Start announce start to a vaild tracker and return peers
-func (m *Manager) Start(hash meta.Hash, status *DownloadStatus) ([]string, error) {
-	for i, t := range m.trackers {
-		peers, err := t.Announce(hash, m.serverID, net.ParseIP(m.serverIP), m.serverPort, EventStart, status)
+func (m *Manager) Start(hash meta.Hash) (<-chan []string, error) {
+	peerC := make(chan []string)
+	go func() {
+		reqs := []announceRequest{
+			announceRequest{event: EventStart},
+		}
+		events := []Event{EventStart}
+		peers, err := m.workTracker().announce(hash, m.serverID, m.serverAddr, reqs[0].event, &reqs[0].stats)
 		if err == nil {
-			m.nowLock.Lock()
-			m.now = i
-			m.nowLock.Unlock()
-			return peers, nil
+			if len(events) == 1 {
+				events[0] = EventNone
+			} else {
+				//pop event
+				reqs = reqs[1:]
+			}
+			peerC <- peers
+		} else {
+			jww.DEBUG.Printf("announce to tracker error:%v\n", err)
+			m.workIndex = (m.workIndex + 1) % len(m.trackers)
 		}
-	}
-	return nil, ErrNoVaildTracker
-}
-
-//Announce request peers to tracker
-func (m *Manager) Announce(hash meta.Hash, status *DownloadStatus) ([]string, error) {
-	return m.announce(hash, status, EventNone)
-}
-
-//Stop tell tracker the task is stop
-func (m *Manager) Stop(hash meta.Hash, status *DownloadStatus) ([]string, error) {
-	return m.announce(hash, status, EventStop)
-}
-
-//Finish announce the tracker the task is complete
-func (m *Manager) Finish(hash meta.Hash, status *DownloadStatus) ([]string, error) {
-	return m.announce(hash, status, EventComplete)
-}
-
-//GetWaitTime return the time will wait for next announce
-func (m *Manager) GetWaitTime() time.Time {
-	m.nowLock.RLock()
-	defer m.nowLock.RUnlock()
-	if m.now == -1 {
-		logger.Fatalln("no vaild tracker")
-	}
-	return m.trackers[m.now].getWaitTime()
-}
-
-func (m *Manager) announce(hash meta.Hash, status *DownloadStatus, event int) (addrs []string, err error) {
-	m.nowLock.RLock()
-	if m.now == -1 {
-		m.nowLock.RUnlock()
-		return nil, ErrNoVaildTracker
-	}
-	addrs, err = m.trackers[m.now].Announce(hash, m.serverID, net.ParseIP(m.serverIP), m.serverPort, event, status)
-	m.nowLock.RUnlock()
-	if err != nil {
-		ps, err := m.Start(hash, status)
-		if err != nil {
-			return nil, ErrNoVaildTracker
+		select {
+		case <-time.After(time.Until(m.workTracker().waitTime())):
+		case r := <-m.reqC:
+			if reqs[0].event == EventNone {
+				reqs[0] = r
+			} else {
+				//pending request
+				reqs = append(reqs, r)
+			}
 		}
-		m.nowLock.RLock()
-		addrs, err = m.trackers[m.now].Announce(hash, m.serverID, net.ParseIP(m.serverIP), m.serverPort, event, status)
-		m.nowLock.RUnlock()
-		addrs = append(addrs, ps...)
-		if err != nil {
-			logger.Fatalln("tracker error")
-		}
+	}()
+	return peerC, nil
+}
+
+//AnnounceStart announce downlaod start to tracker, but manager will auto announce start when invoke Start, so it's need't to use this function
+func (m *Manager) Announce(opts ...Option) {
+	op := new(options)
+	for _, o := range opts {
+		o.apply(op)
 	}
-	return
+	m.reqC <- announceRequest{
+		event: op.event,
+		stats: op.stats,
+	}
+}
+
+//AnnounceRequest is request to tracker
+type announceRequest struct {
+	event Event
+	stats AnnounceStats
+}
+
+func (m *Manager) workTracker() Tracker {
+	return m.trackers[m.workIndex]
 }

@@ -3,18 +3,20 @@ package peer
 import (
 	"context"
 	"crypto/sha1"
-	"errors"
-	"fmt"
+	"encoding/binary"
 	"math/rand"
 	"net"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"github.com/google/logger"
 
+	jww "github.com/spf13/jwalterweatherman"
+	"github.com/wqsa/bget/common"
 	"github.com/wqsa/bget/common/bitmap"
-	"github.com/wqsa/bget/filesystem"
 	"github.com/wqsa/bget/meta"
 	"github.com/wqsa/bget/tracker"
 )
@@ -41,94 +43,91 @@ const (
 )
 
 var (
-	errCreateServer = errors.New("create peer server fail")
+	errCreateServer = errors.New("create Peer server fail")
 	errNotFound     = errors.New("not find")
 	errUnknowMsaage = errors.New("unknow message")
 )
 
-type request struct {
-	index    int
-	begin    int
-	length   int
+type Request struct {
+	common.BlockInfo
 	createAt time.Time
 }
 
-func newRequest(data []byte) *request {
+func newRequest(data []byte) *Request {
 	if len(data) != 12 {
 		return nil
 	}
-	index, offset, _ := unpackUint32(data, 0)
-	begin, offset, _ := unpackUint32(data, offset)
-	length, offset, _ := unpackUint32(data, offset)
-	return &request{int(index), int(begin), int(length), time.Now()}
+	return &Request{
+		BlockInfo: common.BlockInfo{
+			Index:  int(binary.BigEndian.Uint32(data)),
+			Begin:  int(binary.BigEndian.Uint32(data[uint32Len:])),
+			Length: int(binary.BigEndian.Uint32(data[2*uint32Len:])),
+		},
+		createAt: time.Now(),
+	}
 }
 
-func (r *request) hash() string {
-	return fmt.Sprintf("%v%v%v", r.index, r.begin, r.length)
+func (r *Request) hash() string {
+	return r.BlockInfo.Hash()
 }
 
 //Status is downlod stautus
 type Status struct {
 	PeerNum int
-	Status  *tracker.DownloadStatus
+	Status  *tracker.AnnounceStats
 }
 
 //Manager manage peers of the task
 type Manager struct {
-	hash          meta.Hash
-	unchoke       [maxUnchoke]string
-	interest      map[string]bool
-	peers         map[string]*peer
-	fs            *filesystem.FileSystem
-	requests      map[int]request
-	rejectRequest map[int]request
-	peerRequest   map[string][]*peer
-	pieceNum      int
-	pieceLength   int
-	download      int64
-	upload        int64
-	left          int64
-	state         int
-	stateLock     sync.RWMutex
-	need          *bitmap.Bitmap
-	finish        *bitmap.Bitmap
-	blockc        chan *filesystem.Block
-	getStatus     chan chan<- *Status
-	peerc         chan *peer
-	messagec      chan *messageWithID
-	save          chan struct{}
-	closing       chan chan error
-	closec        chan struct{}
-	memc          chan int64
-	lastSave      time.Time
+	hash        meta.Hash
+	pieceNum    int
+	pieceLength int
+
+	unchoke  [maxUnchoke]string
+	interest map[string]bool
+	peers    map[string]*Peer
+
+	requests      map[int]Request
+	rejectRequest map[int]Request
+	peerRequest   map[string][]*Peer
+	requestc      chan Request
+
+	download  int64
+	upload    int64
+	left      int64
+	state     int
+	stateLock sync.RWMutex
+
+	need   *bitmap.Bitmap
+	finish *bitmap.Bitmap
+
+	blockc   chan *common.Block
+	peerc    chan *Peer
+	messagec chan *message
+	save     chan struct{}
+	closec   chan struct{}
+	memc     chan int64
+	datac    chan *common.Block
 }
 
 //NewManager return a Manager instance
 func NewManager(torrent *meta.Torrent, path string, memc chan int64) *Manager {
 	pieceNum := len(torrent.Info.Pieces) / 20
-	fs := filesystem.NewFileSystem(torrent, path)
-	if fs == nil {
-		return nil
-	}
-	need := fs.Need()
 	m := &Manager{
-		hash:          torrent.Info.Hash,
-		pieceNum:      pieceNum,
-		pieceLength:   torrent.Info.PieceLength,
-		need:          need,
+		hash:        torrent.Info.Hash,
+		pieceNum:    pieceNum,
+		pieceLength: torrent.Info.PieceLength,
+		// need:          need,
 		finish:        bitmap.NewEmptyBitmap(pieceNum),
-		fs:            fs,
-		peers:         make(map[string]*peer),
+		peers:         make(map[string]*Peer),
 		interest:      make(map[string]bool),
-		requests:      make(map[int]request),
-		rejectRequest: make(map[int]request),
-		peerRequest:   make(map[string][]*peer),
-		blockc:        make(chan *filesystem.Block),
-		getStatus:     make(chan chan<- *Status),
-		peerc:         make(chan *peer),
-		messagec:      make(chan *messageWithID),
+		requests:      make(map[int]Request),
+		rejectRequest: make(map[int]Request),
+		peerRequest:   make(map[string][]*Peer),
+		blockc:        make(chan *common.Block),
+		peerc:         make(chan *Peer),
+		messagec:      make(chan *message),
 		save:          make(chan struct{}),
-		closing:       make(chan chan error),
 		closec:        make(chan struct{}),
 		memc:          memc,
 	}
@@ -143,78 +142,20 @@ func (m *Manager) Run() (err error) {
 	for {
 		select {
 		case p := <-m.peerc:
-			if p.getState() == stateReady {
-				logger.Infof("add peer %v\n", p.addr)
-				m.peers[p.addr] = p
-				m.initPeer(p)
-				p.stateLock.Lock()
-				p.state = stateRunning
-				go p.recvMessage(m.messagec)
-				p.stateLock.Unlock()
-			} else {
-				go func() {
-					err := p.handshake(m.hash)
-					if err != nil {
-						return
-					}
-					p.setState(stateReady)
-					select {
-					case m.peerc <- p:
-					case <-m.closing:
-						return
-					}
-				}()
-			}
+			logger.Infof("add Peer %v\n", p.addr)
+			m.peers[p.addr] = p
+			m.initPeer(p)
 		case msg := <-m.messagec:
-			p, ok := m.peers[msg.PeerID]
+			p, ok := m.peers[msg.addr]
 			if !ok {
-				logger.Fatalf("peer %v can;t find\n", msg.PeerID)
+				jww.FATAL.Panicf("Peer %v can't find\n", msg.addr)
 			}
-			if ok && (p.getState() == stateRunning) {
-				err = m.handleMessage(p, msg)
-				if err != nil {
-					m.close()
-					return
-				}
-			} else {
-				//logger.Fatalf("%v,state:%v but recive message\n", p.addr, p.getState())
+			if err = m.handleMessage(p, msg); err != nil {
+				m.close()
+				continue
 			}
-		case b := <-m.blockc:
-			r := request{index: b.Index, begin: b.Begin, length: len(b.Data)}
-			peers, ok := m.peerRequest[r.hash()]
-			if !ok {
-				return
-			}
-			for _, p := range peers {
-				p.piece(b.Index, b.Begin, b.Data)
-				p.Upload += int64(len(b.Data))
-				m.upload += int64(len(b.Data))
-			}
-		case statusc := <-m.getStatus:
-			logger.Infoln("send status to tracker")
-			n := 0
-			for _, p := range m.peers {
-				if p.getState() == stateRunning {
-					n++
-				}
-			}
-			statusc <- &Status{
-				PeerNum: n,
-				Status: &tracker.DownloadStatus{
-					Download: m.download,
-					Upload:   m.upload,
-					Left:     m.left,
-				},
-			}
-			logger.Infoln("send status end")
-		case <-m.save:
-			l, err := m.fs.Dump()
-			select {
-			case m.memc <- -l:
-			case errc := <-m.closing:
-				errc <- err
-				return err
-			}
+		case block := <-m.datac:
+			m.replyRequest(block)
 		case <-choke:
 			logger.Infof("update choke")
 			m.updateUnchoke()
@@ -226,54 +167,85 @@ func (m *Manager) Run() (err error) {
 			logger.Infoln("optimistic unchoke")
 			m.optimUnchoke()
 			logger.Infoln("optimistic end")
-		case errc := <-m.closing:
-			errc <- err
+		case <-m.closec:
 			return
 		}
 	}
 }
 
-func (m *Manager) update() {
-	if time.Now().Sub(m.lastSave) > maxSavetimeval {
-		go func() {
-			l, err := m.fs.Dump()
-			if err != nil {
-				m.Close()
-			}
-			select {
-			case m.memc <- l:
-				m.lastSave = time.Now()
-			case <-m.closec:
-				return
-			}
-		}()
-	}
-}
-
-//AddPeer add peer to peers
-func (m *Manager) AddPeer(ctx context.Context, conn net.Conn, extension [reserved]byte) {
-	if m.getState() != taskRunning {
-		return
-	}
-	p := peer{
-		conn:          conn,
-		addr:          conn.RemoteAddr().String(),
-		fastExtension: extension[7]&0x04 != 0,
-		isInterest:    false,
-		isChoke:       true,
-		state:         stateRunning,
-		lastActive:    time.Now(),
-		closing:       make(chan struct{}),
-	}
+func (m *Manager) ReplyRequest(block *common.Block) {
 	select {
-	case m.peerc <- &p:
-	case <-m.closing:
+	case m.datac <- block:
+	case <-m.closec:
 		return
 	}
 }
 
-//AddAddrPeer add peer from addr
-func (m *Manager) AddAddrPeer(addrs []string) {
+func (m *Manager) replyRequest(block *common.Block) {
+	req := &Request{
+		BlockInfo: block.BlockInfo,
+	}
+	if peers, ok := m.peerRequest[req.hash()]; ok {
+		for _, p := range peers {
+			p.SendMessage(context.TODO(), &messagePiece{begin: block.Begin,
+				index: block.Index,
+				data:  block.Data})
+		}
+	}
+}
+
+func (m *Manager) serverPeer(p *Peer) {
+	for {
+		msg, err := p.ReadMessage(context.TODO())
+		if err != nil {
+			jww.INFO.Println("read message error:", err)
+			p.Close()
+		}
+		m.messagec <- msg
+	}
+}
+
+func (m *Manager) update() {
+	// if time.Now().Sub(m.lastSave) > maxSavetimeval {
+	// 	go func() {
+	// 		l, err := m.fs.Dump()
+	// 		if err != nil {
+	// 			m.Close()
+	// 		}
+	// 		select {
+	// 		case m.memc <- l:
+	// 			m.lastSave = time.Now()
+	// 		case <-m.closec:
+	// 			return
+	// 		}
+	// 	}()
+	// }
+}
+
+//AddPeer add Peer to peers
+// func (m *Manager) AddPeer(ctx context.Context, conn net.Conn, extension [reserved]byte) {
+// 	if m.getState() != taskRunning {
+// 		return
+// 	}
+// 	p := Peer{
+// 		conn:          conn,
+// 		addr:          conn.RemoteAddr().String(),
+// 		fastExtension: extension[7]&0x04 != 0,
+// 		isInterest:    false,
+// 		isChoke:       true,
+// 		state:         stateRunning,
+// 		lastActive:    time.Now(),
+// 		closing:       make(chan struct{}),
+// 	}
+// 	select {
+// 	case m.peerc <- &p:
+// 	case <-m.closing:
+// 		return
+// 	}
+// }
+
+//AddRawPeer add Peer by addr
+func (m *Manager) AddRawPeer(addrs []string) {
 	if m.getState() != taskRunning {
 		return
 	}
@@ -282,26 +254,18 @@ func (m *Manager) AddAddrPeer(addrs []string) {
 		wg.Add(1)
 		addr := addr
 		go func() {
-			p := newPeer(nil, addr)
 			defer wg.Done()
-			if p == nil {
-				logger.Errorf("peer %v init fail\n", addr)
-				return
-			}
-			err := p.handshake(m.hash)
+			p, err := newPeer(nil, addr)
 			if err != nil {
-				logger.Warningf("%v handshake fail, %v\n", p.addr, err)
+				jww.TRACE.Printf("Peer %v init fail\n", addr)
 				return
 			}
-			err = p.recvHandshake(m.hash)
-			if err != nil {
-				logger.Warningf("%v check handshake fail, %v\n", p.addr, err)
-				return
+			if err := p.dial(); err != nil {
+				jww.TRACE.Printf("peer dail failed: %+v\n", err)
 			}
-			p.setState(stateReady)
 			select {
 			case m.peerc <- p:
-			case <-m.closing:
+			case <-m.closec:
 				return
 			}
 		}()
@@ -311,34 +275,30 @@ func (m *Manager) AddAddrPeer(addrs []string) {
 
 //GetStatus return downalod status
 func (m *Manager) GetStatus() *Status {
-	if m.getState() != taskRunning {
-		return nil
-	}
-	statusc := make(chan *Status)
-	select {
-	case m.getStatus <- statusc:
-		select {
-		case status := <-statusc:
-			return status
-		case <-m.closec:
-			return nil
-		}
-	case <-m.closec:
-		return nil
-	}
+	// if m.getState() != taskRunning {
+	// 	return nil
+	// }
+	// statusc := make(chan *Status)
+	// select {
+	// case m.getStatus <- statusc:
+	// 	select {
+	// 	case status := <-statusc:
+	// 		return status
+	// 	case <-m.closec:
+	// 		return nil
+	// 	}
+	// case <-m.closec:
+	// 	return nil
+	// }
+	return nil
 }
 
-//Save save data from memory to disk
-func (m *Manager) Save() {
-	if m.getState() != taskRunning {
-		return
-	}
-	select {
-	case m.save <- struct{}{}:
-	case <-m.closec:
-		return
-	}
-	return
+func (m *Manager) GetRequest() <-chan Request {
+	return m.requestc
+}
+
+func (m *Manager) GetData() <-chan common.Block {
+	return nil
 }
 
 func (m *Manager) getState() int {
@@ -355,13 +315,13 @@ func (m *Manager) setState(state int) {
 }
 
 func (m *Manager) close() error {
-	logger.Errorln("peer manager closing")
+	logger.Errorln("Peer manager closing")
 	for _, p := range m.peers {
 		if p.getState() == stateRunning {
 			p.Close()
 		}
 	}
-	close(m.closing)
+	close(m.closec)
 	m.setState(taskInit)
 	return nil
 }
@@ -371,45 +331,44 @@ func (m *Manager) Close() error {
 	if m.getState() != taskRunning {
 		return nil
 	}
-	errc := make(chan error)
-	m.closing <- errc
-	err := <-errc
+	// errc := make(chan error)
+	// m.closing <- errc
+	// err := <-errc
 	m.close()
-	return err
+	return nil
 }
 
-func (m *Manager) initPeer(p *peer) {
+func (m *Manager) initPeer(p *Peer) {
 	p.Bitmap = bitmap.NewEmptyBitmap(m.pieceNum)
 	if p.fastExtension {
 		m.generateFastSet(p)
 		for _, v := range p.fastSet {
-			p.allowedFast(v)
+			p.SendMessage(context.TODO(), &messageAllowedFast{v})
 		}
-		if m.download < int64(m.pieceLength) {
-			p.haveNone()
-		} else if m.left == 0 {
-			p.haveAll()
-		} else {
-			p.bitfield(m.finish)
-		}
+	}
+	//TODO may be should check bitmap
+	if m.download < int64(m.pieceLength) {
+		p.SendMessage(context.TODO(), new(messageHaveNone))
+	} else if m.left == 0 {
+		p.SendMessage(context.TODO(), new(messageHaveAll))
 	} else {
-		p.bitfield(m.finish)
+		p.SendMessage(context.TODO(), &messageBitfield{m.finish})
 	}
 }
 
 func (m *Manager) have(index int) {
 	for _, p := range m.peers {
-		p.have(index)
+		p.SendMessage(context.TODO(), new(messageHave))
 	}
 }
 
 func (m *Manager) updateUnchoke() {
 	//too foolish
-	ps := []*peer{}
+	ps := []*Peer{}
 	for k := range m.interest {
 		p, ok := m.peers[k]
 		if !ok {
-			logger.Fatalln("can't find the peer")
+			logger.Fatalln("can't find the Peer")
 		}
 		if p.getState() == stateRunning {
 			ps = append(ps, p)
@@ -438,7 +397,7 @@ func (m *Manager) updateUnchoke() {
 			}
 		}
 		if h == -1 {
-			p.unchoke()
+			p.SendMessage(context.TODO(), new(messageUnchoke))
 		} else {
 			copy(m.unchoke[:], m.unchoke[:h])
 			copy(m.unchoke[:h], m.unchoke[h+1:])
@@ -447,7 +406,7 @@ func (m *Manager) updateUnchoke() {
 	}
 	for i := 0; i < t; i++ {
 		if p, ok := m.peers[m.unchoke[i]]; ok {
-			p.choke()
+			p.SendMessage(context.TODO(), new(messageChoke))
 		}
 	}
 	for i := range ps[:n] {
@@ -459,7 +418,7 @@ func (m *Manager) optimUnchoke() {
 	for k, p := range m.peers {
 		if k != m.unchoke[maxUnchoke-1] && !m.interest[k] {
 			if p.getState() == stateInit {
-				p.unchoke()
+				p.SendMessage(context.TODO(), new(messageUnchoke))
 				m.unchoke[maxUnchoke-1] = k
 			}
 			return
@@ -467,24 +426,28 @@ func (m *Manager) optimUnchoke() {
 	}
 }
 
-func (m *Manager) handleMessage(p *peer, msg *messageWithID) (err error) {
+func (m *Manager) handleMessage(p *Peer, msg *message) (err error) {
 	logger.Infof("handle message:%#v from %v\n", msg.ID, p.addr)
-	switch msg.ID {
+	switch msgID(msg.ID) {
 	case msgChoke:
 		err = m.handleChoke(p)
 	case msgUnchoke:
 		err = m.handleUnchoke(p)
 	case msgBitfield:
-		err = m.handleField(p, msg.Data.(*bitmap.Bitmap))
+		bitmap := bitmap.NewBitmap(msg.body)
+		err = m.handleField(p, bitmap)
 	case msgPiece:
-		err = m.handlePiece(p, msg.Data.(*filesystem.Block))
+		// block := newBlock(msg.body)
+		// err = m.handlePiece(p, block)
 	case msgRequest:
-		err = m.handleReq(p, msg.Data.(*request))
+		req := newRequest(msg.body)
+		err = m.handleReq(p, req)
 	case msgCancel:
-		err = m.handleCancel(p, msg.Data.(*request))
+		req := newRequest(msg.body)
+		err = m.handleCancel(p, req)
 	case msgHave:
-		err = m.handleHave(p, msg.Data.(int))
-	case msgHaveALL:
+		err = m.handleHave(p, int(binary.BigEndian.Uint32(msg.body)))
+	case msgHaveAll:
 		b := bitmap.NewEmptyBitmap(m.pieceNum)
 		b.SetRangeBitOn(0, b.Len())
 		err = m.handleField(p, b)
@@ -492,11 +455,12 @@ func (m *Manager) handleMessage(p *peer, msg *messageWithID) (err error) {
 		b := bitmap.NewEmptyBitmap(m.pieceNum)
 		err = m.handleField(p, b)
 	case msgSuggestPiece:
-		err = m.handelSuggestPiece(p, msg.Data.(int))
+		err = m.handelSuggestPiece(p, int(binary.BigEndian.Uint32(msg.body)))
 	case msgRejectRequest:
-		err = m.handleRejectReq(p, msg.Data.(*request))
+		req := newRequest(msg.body)
+		err = m.handleRejectReq(p, req)
 	case msgAllowedFast:
-		err = m.handleAllowedFast(p, msg.Data.(int))
+		err = m.handleAllowedFast(p, int(binary.BigEndian.Uint32(msg.body)))
 	default:
 		logger.Errorln("unknow message", msg.ID)
 		err = errUnknowMsaage
@@ -504,19 +468,19 @@ func (m *Manager) handleMessage(p *peer, msg *messageWithID) (err error) {
 	return
 }
 
-func (m *Manager) handleChoke(p *peer) error {
+func (m *Manager) handleChoke(p *Peer) error {
 	p.isChoke = true
 	return nil
 }
 
-func (m *Manager) handleUnchoke(p *peer) error {
+func (m *Manager) handleUnchoke(p *Peer) error {
 	p.isChoke = false
 	if !m.interest[p.addr] {
 		if !m.isInterest(p) {
 			return nil
 		}
 		m.interest[p.addr] = true
-		p.interest()
+		p.SendMessage(context.TODO(), new(messageInterest))
 	}
 	index := m.selectPiece(p)
 	if index == -1 {
@@ -526,25 +490,33 @@ func (m *Manager) handleUnchoke(p *peer) error {
 	return nil
 }
 
-func (m *Manager) requestPiece(p *peer, index int) {
+func (m *Manager) requestPiece(p *Peer, index int) {
 	if p.haveReq {
 		return
 	}
 	r, ok := m.requests[index]
 	if ok {
-		if r.begin+r.length >= m.pieceLength {
+		if r.Begin+r.Length >= m.pieceLength {
 			delete(m.requests, index)
 			goto requestNew
 		}
 		m.nextRequest(&r)
-		p.request(&r)
+		p.SendMessage(context.TODO(), &messageRequest{
+			index:  r.Index,
+			begin:  r.Begin,
+			length: maxRequestLength,
+		})
 		m.requests[index] = r
 		p.haveReq = true
 		return
 	}
 	r, ok = m.rejectRequest[index]
 	if ok {
-		p.request(&r)
+		p.SendMessage(context.TODO(), &messageRequest{
+			index:  r.Index,
+			begin:  r.Begin,
+			length: maxRequestLength,
+		})
 		delete(m.rejectRequest, index)
 		r.createAt = time.Now()
 		m.requests[index] = r
@@ -552,35 +524,46 @@ func (m *Manager) requestPiece(p *peer, index int) {
 		return
 	}
 requestNew:
-	r = request{index, 0, maxRequestLength, time.Now()}
-	p.request(&r)
+	r = Request{
+		BlockInfo: common.BlockInfo{
+			Begin:  0,
+			Index:  index,
+			Length: maxRequestLength,
+		},
+		createAt: time.Now(),
+	}
+	p.SendMessage(context.TODO(), &messageRequest{
+		index:  index,
+		begin:  0,
+		length: maxRequestLength,
+	})
 	m.requests[index] = r
 	p.haveReq = true
 }
 
-func (m *Manager) nextRequest(r *request) {
-	if r.begin+r.length >= m.pieceLength {
+func (m *Manager) nextRequest(r *Request) {
+	if r.Begin+r.Length >= m.pieceLength {
 		logger.Fatalln("this is last request")
 	}
-	r.begin = r.begin + r.length
-	if r.begin+r.length < m.pieceLength-maxRequestLength {
-		r.length = maxRequestLength
+	r.Begin = r.Begin + r.Length
+	if r.Begin+r.Length < m.pieceLength-maxRequestLength {
+		r.Length = maxRequestLength
 	} else {
-		r.length = m.pieceLength - r.begin - r.length
+		r.Length = m.pieceLength - r.Begin - r.Length
 	}
 }
 
-func (m *Manager) handleInterset(p *peer) error {
+func (m *Manager) handleInterset(p *Peer) error {
 	p.isInterest = true
 	return nil
 }
 
-func (m *Manager) handleNoInterest(p *peer) error {
+func (m *Manager) handleNoInterest(p *Peer) error {
 	p.isInterest = false
 	return nil
 }
 
-func (m *Manager) handleHave(p *peer, index int) error {
+func (m *Manager) handleHave(p *Peer, index int) error {
 	if index < 0 || index > m.pieceNum {
 		p.Close()
 		return nil
@@ -591,13 +574,13 @@ func (m *Manager) handleHave(p *peer, index int) error {
 	}
 	if !m.interest[p.addr] && m.need.MustGetBit(index) && !p.isChoke {
 		m.interest[p.addr] = true
-		p.interest()
+		p.SendMessage(context.TODO(), new(messageInterest))
 		m.requestPiece(p, index)
 	}
 	return nil
 }
 
-func (m *Manager) handleField(p *peer, field *bitmap.Bitmap) error {
+func (m *Manager) handleField(p *Peer, field *bitmap.Bitmap) error {
 	if field.Len() != m.pieceNum {
 		if field.Len()/8 == (m.pieceNum-1)/8+1 && field.MustCountBitOn(m.pieceNum, field.Len()) == 0 {
 			field.Truncate(m.pieceNum)
@@ -609,75 +592,48 @@ func (m *Manager) handleField(p *peer, field *bitmap.Bitmap) error {
 	p.Bitmap.Assign(field)
 	if m.isInterest(p) {
 		m.interest[p.addr] = true
-		p.interest()
+		p.SendMessage(context.TODO(), new(messageInterest))
 	}
 	return nil
 }
 
-func (m *Manager) handlePiece(p *peer, b *filesystem.Block) error {
-	l, err := m.fs.SavePiece(b.Index, b.Begin, b.Data)
-	if err != nil {
-		if err == filesystem.ErrInvaildIndex || err == filesystem.ErrWrongOrder {
-			p.Close()
-			return nil
-		}
-		if err == filesystem.ErrPieceCheck {
-			select {
-			case m.memc <- int64(-m.pieceLength):
-			case <-m.closec:
-				return nil
-			}
-			delete(m.requests, b.Index)
-			return nil
-		}
-		return err
-	}
+func (m *Manager) handlePiece(p *Peer, b *common.Block) error {
 	select {
-	case m.memc <- int64(l):
+	case m.datac <- b:
 	case <-m.closec:
-		return nil
 	}
-	m.download += int64(l)
-	if b.Begin+len(b.Data) >= m.pieceLength {
-		m.finish.SetBitOn(b.Index)
-		m.need.SetBitOff(b.Index)
-	}
-	m.requestPiece(p, b.Index)
 	return nil
 }
 
-func (m *Manager) handleReq(p *peer, r *request) (err error) {
-	if r.index < 0 || r.index > m.pieceNum {
+func (m *Manager) handleReq(p *Peer, r *Request) (err error) {
+	if r.Index < 0 || r.Index > m.pieceNum {
+		jww.TRACE.Printf("bad request, piece:%v, but piece num:%v\n", r.Index, m.pieceNum)
 		p.Close()
 		return
 	}
-	if !m.finish.MustGetBit(r.index) {
-		p.rejectRequest(r)
-		return
-	}
-	find := false
 	for _, v := range m.unchoke {
 		if v == p.addr {
-			find = true
+			if !m.finish.MustGetBit(r.Index) {
+				break
+			}
+			m.peerRequest[r.hash()] = append(m.peerRequest[r.hash()], p)
+			select {
+			case m.requestc <- *r:
+			case <-m.closec:
+			}
+			return
 		}
 	}
-	if !find {
-		p.rejectRequest(r)
-		return
-	}
-
-	h := r.hash()
-	if _, ok := m.peerRequest[h]; ok {
-		m.peerRequest[r.hash()] = append(m.peerRequest[r.hash()], p)
-	} else {
-		m.peerRequest[r.hash()] = []*peer{p}
-	}
-	go m.fs.RequestData(r.index, r.begin, r.length, m.blockc)
+	p.SendMessage(context.TODO(), &messageRejectRequest{
+		index:  r.Index,
+		begin:  r.Begin,
+		length: r.Length,
+	})
 	return
 }
 
-func (m *Manager) handleCancel(p *peer, r *request) (err error) {
-	if r.index < 0 || r.index > m.pieceNum {
+func (m *Manager) handleCancel(p *Peer, r *Request) (err error) {
+	if r.Index < 0 || r.Index > m.pieceNum {
 		p.Close()
 		return
 	}
@@ -689,7 +645,7 @@ func (m *Manager) handleCancel(p *peer, r *request) (err error) {
 	return
 }
 
-func (m *Manager) handelSuggestPiece(p *peer, index int) (err error) {
+func (m *Manager) handelSuggestPiece(p *Peer, index int) (err error) {
 	if index < 0 || index > m.pieceNum {
 		return
 	}
@@ -699,19 +655,19 @@ func (m *Manager) handelSuggestPiece(p *peer, index int) (err error) {
 	return
 }
 
-func (m *Manager) handleRejectReq(p *peer, r *request) (err error) {
-	if r.index < 0 || r.index > m.pieceNum {
+func (m *Manager) handleRejectReq(p *Peer, r *Request) (err error) {
+	if r.Index < 0 || r.Index > m.pieceNum {
 		return
 	}
-	if _, ok := m.requests[r.index]; !ok {
+	if _, ok := m.requests[r.Index]; !ok {
 		p.Close()
 		return
 	}
-	m.rejectRequest[r.index] = *r
+	m.rejectRequest[r.Index] = *r
 	return
 }
 
-func (m *Manager) handleAllowedFast(p *peer, index int) (err error) {
+func (m *Manager) handleAllowedFast(p *Peer, index int) (err error) {
 	if index < 0 || index > m.pieceNum {
 		return
 	}
@@ -721,7 +677,7 @@ func (m *Manager) handleAllowedFast(p *peer, index int) (err error) {
 	return
 }
 
-func (m *Manager) selectPiece(p *peer) int {
+func (m *Manager) selectPiece(p *Peer) int {
 	if m.state != taskRunning {
 		return -1
 	}
@@ -748,27 +704,28 @@ func (m *Manager) selectPiece(p *peer) int {
 	return -1
 }
 
-func (m *Manager) isInterest(p *peer) bool {
+func (m *Manager) isInterest(p *Peer) bool {
 	interest := m.need.And(p.Bitmap)
 	return interest.MustCountBitOn(0, interest.Len()) > 0
 }
 
 //according to http://www.bittorrenps.org/beps/bep_0006.html
-func (m *Manager) generateFastSet(p *peer) {
+func (m *Manager) generateFastSet(p *Peer) {
 	ip, _, err := net.SplitHostPort(p.addr)
 	if err != nil {
 		panic(err)
 	}
-	i, _, _ := unpackUint32(net.ParseIP(ip), 0)
+	i := int(binary.BigEndian.Uint32(net.ParseIP(ip)))
 	i &= 0xffffff00
-	x := packUint32([]byte{}, i)
+	x := make([]byte, uint32Len)
+	binary.BigEndian.PutUint32(x, uint32(i))
 	x = append(x, m.hash[:]...)
 	for len(p.fastSet) < fastSetSize {
 		h := sha1.Sum(x)
 		x = h[:]
 		for i := 0; i < 5 && len(p.fastSet) < fastSetSize; i += 4 {
 			y := x[i : i+4]
-			index, _, _ := unpackUint32(y, 0)
+			index := binary.BigEndian.Uint32(y)
 			index = index % uint32(m.pieceLength)
 			have := false
 			for _, v := range p.fastSet {

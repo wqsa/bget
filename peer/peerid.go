@@ -2,12 +2,13 @@ package peer
 
 import (
 	"bytes"
-	"errors"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/wqsa/bget/common/utils"
+	"github.com/pkg/errors"
+
+	"github.com/wqsa/bget/common"
 )
 
 var clientPrefix = map[string]string{
@@ -177,7 +178,7 @@ func newAzureusID(client, version string) (peerID, error) {
 	identifier := "-" + client + strings.Join(v, "") + "-"
 	id := [idLength]byte{}
 	copy(id[:], []byte(identifier))
-	b := utils.RandBytes(idLength - len(identifier))
+	b := common.RandBytes(idLength - len(identifier))
 	copy(id[len(identifier):], b)
 	return peerID(id), nil
 }
@@ -216,13 +217,13 @@ func newShadowID(client, version string) (peerID, error) {
 	}
 	id := [idLength]byte{}
 	copy(id[:], []byte(identifier))
-	b := utils.RandBytes(idLength - len(identifier))
+	b := common.RandBytes(idLength - len(identifier))
 	copy(id[len(identifier):], b)
 	return peerID(id), nil
 }
 
 func newRandomID() peerID {
-	b := utils.RandBytes(idLength)
+	b := common.RandBytes(idLength)
 	id := [PeerIDLen]byte{}
 	copy(id[:], b[:idLength])
 	return peerID(id)

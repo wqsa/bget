@@ -1,9 +1,10 @@
 package dht
 
 import (
-	"errors"
 	"os"
 	"time"
+
+	"github.com/pkg/errors"
 
 	"github.com/google/logger"
 )

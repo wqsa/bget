@@ -1,68 +1,37 @@
 package tracker
 
 import (
-	"context"
 	"encoding/hex"
-	"fmt"
 	"net/url"
-	"sync"
 	"testing"
-	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/wqsa/bget/meta"
+)
+
+const (
+	httpTrackerURL = `http://torrent.ubuntu.com:6969/announce`
+	udpTrackerURL  = `udp://tracker.internetwarriors.net:1337`
 )
 
 func TestHTTPTracker(t *testing.T) {
-	u := HTTPTracker{`http://torrent.ubuntu.com:6969/announce`, 0, nil, time.Now(), true}
-	ctx := context.Background()
+	u, err := url.Parse(httpTrackerURL)
+	assert.Nilf(t, err, "%+v", err)
+	tracker := newhttpTracker(u)
 	infoHash := [20]byte{}
-	hex.Decode(infoHash[:], []byte("56061fb42e24c9ded06173888ba0b46c06be6088"))
-	ctx = context.WithValue(ctx, StateKey("info hash"), infoHash)
-	ctx = context.WithValue(ctx, StateKey("peer id"), infoHash)
-	ctx = context.WithValue(ctx, StateKey("download"), uint64(0))
-	ctx = context.WithValue(ctx, StateKey("left"), uint64(1502208))
-	ctx = context.WithValue(ctx, StateKey("upload"), uint64(0))
-	ctx = context.WithValue(ctx, StateKey("event"), httpEventStart)
-	ctx = context.WithValue(ctx, StateKey("want"), 50)
-	ctx = context.WithValue(ctx, StateKey("ip"), "")
-	ctx = context.WithValue(ctx, StateKey("port"), 1080)
-	peers, err := u.Announce(ctx)
-	if err != nil {
-		t.Error(err)
-	}
-	wg := sync.WaitGroup{}
-	for _, p := range peers {
-		wg.Add(1)
-		peer := p
-		go func() {
-			err = peer.Handshake(infoHash)
-			if err != nil {
-				t.Error(err)
-			} else {
-				peer.Interest()
-			}
-			wg.Done()
-		}()
-	}
-	wg.Wait()
+	_, err = hex.Decode(infoHash[:], []byte("28f0bb34b542af1609641fcf4188afed73a03f64"))
+	assert.Nil(t, err)
+	_, err = tracker.announce(meta.Hash(infoHash), make([]byte, 20), "127.0.0.1:6882", EventStart, &AnnounceStats{})
+	assert.Nilf(t, err, "%+v", err)
 }
 
 func TestUDPTracker(t *testing.T) {
-	url, _ := url.Parse(`udp://tracker.internetwarriors.net:1337`)
-	u := UDPTracker{*url, 0, nil, 0, time.Now()}
-	ctx := context.Background()
+	u, err := url.Parse(udpTrackerURL)
+	assert.Nilf(t, err, "%+v", err)
+	tracker := newudpTracker(u)
 	infoHash := [20]byte{}
-	hex.Decode(infoHash[:], []byte("A753EA13F243EF9C4006D103DCBDBC7CABAD8A01"))
-	ctx = context.WithValue(ctx, StateKey("info hash"), infoHash)
-	ctx = context.WithValue(ctx, StateKey("peer id"), infoHash)
-	ctx = context.WithValue(ctx, StateKey("download"), uint64(0))
-	ctx = context.WithValue(ctx, StateKey("left"), uint64(1502208))
-	ctx = context.WithValue(ctx, StateKey("upload"), uint64(0))
-	ctx = context.WithValue(ctx, StateKey("event"), udpEventStart)
-	ctx = context.WithValue(ctx, StateKey("want"), -1)
-	ctx = context.WithValue(ctx, StateKey("ip"), "")
-	ctx = context.WithValue(ctx, StateKey("port"), 1080)
-	peers, err := u.Announce(ctx)
-	if err != nil {
-		t.Error(err)
-	}
-	fmt.Println(peers)
+	_, err = hex.Decode(infoHash[:], []byte("F47279403014580AFB851A344D91BE39015CEC96"))
+	assert.Nil(t, err)
+	_, err = tracker.announce(meta.Hash(infoHash), make([]byte, 20), "127.0.0.1:6882", EventStart, &AnnounceStats{})
+	assert.Nilf(t, err, "%+v", err)
 }

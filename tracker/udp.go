@@ -1,21 +1,25 @@
 package tracker
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
-	"errors"
 	"math/rand"
 	"net"
 	"net/url"
+	"strconv"
 	"time"
 
+	"github.com/pkg/errors"
+
+	"github.com/wqsa/bget/common"
 	"github.com/wqsa/bget/meta"
 )
 
 const (
 	protocolID int64 = 0x41727101980
 
-	//connectReq.action and connectResp.action
+	//connectRequest.action and connectResponse.action
 	actionConnect  int32 = 0
 	actionAnnounce int32 = 1
 
@@ -42,29 +46,28 @@ var (
 	errAnnPara    = errors.New("announce parameter error")
 )
 
-//UDPTracker is a tracker use UDP
-type UDPTracker struct {
-	url.URL
+//udpTracker is a tracker use UDP
+type udpTracker struct {
+	*url.URL
 	connID     int64
 	conn       net.Conn
-	tranID     int32
 	nextTime   time.Time
-	RecvStatus chan DownloadStatus
+	RecvStatus chan AnnounceStats
 }
 
-type connectReq struct {
+type connectRequest struct {
 	ProtocolID    int64
 	Action        int32
 	TransactionID int32
 }
 
-type connectResp struct {
+type connectResponse struct {
 	Action    int32
 	TranID    int32
 	ConnectID int64
 }
 
-type annReq struct {
+type udpAnnounceRequest struct {
 	ConnectID int64
 	Action    int32
 	TranID    int32
@@ -80,134 +83,130 @@ type annReq struct {
 	Port      uint16
 }
 
-type annResp struct {
+type announceResponse struct {
 	Action   int32
 	TranID   int32
 	Interval int32
 	Leechers int32
 	Seeders  int32
-	Peers    [udpPeerNum * 6]byte
 }
 
-//NewUDPTracker is used for create a udp tracker
-func NewUDPTracker(rawurl string) *UDPTracker {
-	url, err := url.Parse(rawurl)
+func newudpTracker(u *url.URL) *udpTracker {
+	return &udpTracker{URL: u}
+}
+
+func (t *udpTracker) connect() error {
+	var err error
+	t.conn, err = net.Dial("udp", t.Host)
 	if err != nil {
-		return nil
+		return err
 	}
-	return &UDPTracker{URL: *url}
+	tranID := rand.Int31()
+	req := connectRequest{protocolID, actionConnect, tranID}
+	data, err := t.request(req)
+	if err != nil {
+		return err
+	}
+	resp := new(connectResponse)
+	r := bytes.NewReader(data)
+	err = binary.Read(r, binary.BigEndian, resp)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if resp.Action != actionConnect || resp.TranID != tranID {
+		return errUDPResp
+	}
+	t.connID = resp.ConnectID
+	return nil
 }
 
-func (t *UDPTracker) getWaitTime() time.Time {
-	return t.nextTime
-}
-
-//Announce is used to announce to tracker
-func (t *UDPTracker) Announce(hash meta.Hash, id []byte, ip net.IP, port int, event int, status *DownloadStatus) ([]string, error) {
+func (t *udpTracker) announce(hash meta.Hash, id []byte, addr string, event Event, stats *AnnounceStats) ([]string, error) {
 	if t.conn == nil {
 		err := t.connect()
 		if err != nil {
 			return nil, err
 		}
 	}
-	data, err := t.announce(hash, event, status)
+	ipStr, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
-	peers := convAddrs(data)
-	if peers == nil {
-		return nil, errUDPResp
-	}
-	return peers, nil
-}
-
-func (t *UDPTracker) close() error {
-	return t.conn.Close()
-}
-
-func getTransID() int32 {
-	return rand.Int31()
-}
-
-func (t *UDPTracker) connect() error {
-	var err error
-	t.conn, err = net.Dial("udp", t.Host)
+	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return err
+		return nil, errors.WithStack(err)
 	}
-	t.tranID = getTransID()
-	req := connectReq{protocolID, actionConnect, t.tranID}
-	err = binary.Write(t.conn, binary.BigEndian, req)
-	if err != nil {
-		return err
-	}
-
-	var resp connectResp
-	timeout := udpBaseTimeout
-	for {
-		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
-		t.conn.SetReadDeadline(deadline)
-		err = binary.Read(t.conn, binary.BigEndian, &resp)
-		if err == nil {
-			break
-		}
-		if !isTimeOut(err) {
-			return errUDPTimeOut
-		}
-		if timeout *= 2; timeout > udpWaitMaxTime {
-			return err
-		}
-	}
-	if resp.Action == actionConnect && t.tranID == resp.TranID {
-		t.connID = resp.ConnectID
-		return nil
-	}
-	return errUDPResp
-}
-
-func (t *UDPTracker) announce(hash meta.Hash, event int, status *DownloadStatus) ([]byte, error) {
-	req := annReq{
+	tranID := rand.Int31()
+	req := udpAnnounceRequest{
 		ConnectID: t.connID,
+		InfoHash:  hash,
 		Action:    actionAnnounce,
-		TranID:    t.tranID,
-		Key:       rand.Int31(),
-		Download:  status.Download,
-		Left:      status.Left,
-		Upload:    status.Upload,
+		TranID:    tranID,
+		Download:  stats.Download,
+		Left:      stats.Left,
+		Upload:    stats.Upload,
 		Event:     int32(event),
+		Port:      uint16(port),
 		Want:      -1,
 	}
-	if req.Event == EventNone {
+	copy(req.IP[:], net.ParseIP(ipStr))
+	if req.Event == int32(EventNone) {
 		if t.nextTime.After(time.Now()) {
 			return nil, errWaitTime
 		}
 	}
+	data, err := t.request(req)
+	if err != nil {
+		return nil, err
+	}
+	r := bytes.NewReader(data)
+	resp := new(announceResponse)
+	if err = binary.Read(r, binary.BigEndian, resp); err != nil {
+		return nil, err
+	}
+	if resp.Action != actionAnnounce || resp.TranID != tranID {
+		return nil, errUDPResp
+	}
+	t.nextTime = time.Now().Add(time.Duration(resp.Interval) * time.Second)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := common.ParseCompressIPV4Addrs(data[20:])
+	if err != nil {
+		return nil, errUDPResp
+	}
+	return addrs, nil
+}
+
+func (t *udpTracker) waitTime() time.Time {
+	return t.nextTime
+}
+
+func (t *udpTracker) close() error {
+	return t.conn.Close()
+}
+
+func (t *udpTracker) request(req interface{}) ([]byte, error) {
 	err := binary.Write(t.conn, binary.BigEndian, req)
 	if err != nil {
 		return nil, err
 	}
-	resp := annResp{}
 	timeout := udpBaseTimeout
 	for {
 		deadline := time.Now().Add(time.Duration(timeout) * time.Second)
 		t.conn.SetReadDeadline(deadline)
-		err = binary.Read(t.conn, binary.BigEndian, &resp)
-		if resp.TranID != 0 {
-			break
+		recv := make([]byte, 20+6*udpPeerNum)
+		n, err := t.conn.Read(recv)
+		if err != nil {
+			if isTimeOut(err) {
+				if timeout *= 2; timeout > udpWaitMaxTime {
+					return nil, errUDPTimeOut
+				}
+				continue
+			}
+			return nil, errors.WithStack(err)
 		}
-		if !isTimeOut(err) {
-			return nil, err
-		}
-		if timeout *= 2; timeout > udpWaitMaxTime {
-			return nil, errUDPTimeOut
-		}
+		return recv[:n], nil
 	}
-	if resp.Action != actionAnnounce || resp.TranID != t.tranID {
-		return nil, errUDPResp
-	}
-	t.nextTime = time.Now().Add(time.Duration(resp.Interval) * time.Second)
-	return resp.Peers[:], nil
-	//return peer.NewRawPeers(false, resp.Peers[:]), nil
 }
 
 func isTimeOut(err error) bool {

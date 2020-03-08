@@ -1,11 +1,12 @@
 package dht
 
 import (
-	"errors"
 	"math/rand"
 	"net"
 	"strconv"
 	"time"
+
+	"github.com/pkg/errors"
 
 	"github.com/wqsa/bget/bencode"
 	"github.com/wqsa/bget/common/utils"
@@ -250,7 +251,7 @@ func (c *krpcClient) getPeers(ownID *nodeID, infoHash [20]byte) ([]string, []*no
 	if len(resp.Values) != 0 {
 		addrs := make([]string, 0, len(resp.Values))
 		for _, p := range resp.Values {
-			a, err := utils.ParseIPV4Addr([]byte(p))
+			a, err := utils.ParseCompressIPV4Addr([]byte(p))
 			if err != nil {
 				return nil, nil, "", err
 			}
@@ -368,7 +369,7 @@ func (c *krpcClient) announcePeer(own *node, infoHash [20]byte, token string) (*
 // 	if len(resp.Values) != 0 {
 // 		addrs := make([]string, 0, len(resp.Values))
 // 		for _, p := range resp.Values {
-// 			a, err := utils.ParseIPV4Addr([]byte(p))
+// 			a, err := utils.ParseCompressIPV4Addr([]byte(p))
 // 			if err != nil {
 // 				return nil, nil, "", err
 // 			}
